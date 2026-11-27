@@ -1,5 +1,6 @@
 #pragma once
 #include "vulkan_gpu_labels.h"
+#include "gpu_dispatch_profile.h"  // LOCAL DIAGNOSTIC
 
 // The execution side of the D3D12 layer, without COM: the per-device Vulkan context (resources, layout tracker,
 // image views), queues that execute command lists, and timeline-semaphore fences. The COM objects in
@@ -145,6 +146,7 @@ struct VulkanDeviceFunctions {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(leonida::device_proc_or_khr(get, device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
 #undef LEONIDA_VK_LOAD
+        leonida::gpu_profile::init(get, device);  // LOCAL DIAGNOSTIC
         return vkCreateCommandPool && vkDestroyCommandPool && vkAllocateCommandBuffers && vkResetCommandBuffer &&
                vkBeginCommandBuffer && vkEndCommandBuffer && vkQueueSubmit && vkQueueWaitIdle && vkCreateSemaphore &&
                vkDestroySemaphore && vkGetSemaphoreCounterValue && vkWaitSemaphores && vkSignalSemaphore &&
@@ -1607,6 +1609,7 @@ public:
         std::unique_lock lock(pipeline_mutex_);
         pipelines_[id] = pipeline;
         if (shader && device_fault_) device_fault_->pipeline_names[id] = {shader};
+        leonida::gpu_profile::name(id, shader);  // LOCAL DIAGNOSTIC
     }
     void remove_pipeline(std::uintptr_t id) {
         std::unique_lock lock(pipeline_mutex_);

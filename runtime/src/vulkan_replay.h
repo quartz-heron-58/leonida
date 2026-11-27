@@ -4,6 +4,7 @@
 #include <cstdlib>
 
 #include "resource_tiling.h"
+#include "gpu_dispatch_profile.h"  // LOCAL DIAGNOSTIC
 
 // Replays a closed CommandList (command_list.h) into a Vulkan command buffer.
 //
@@ -5374,9 +5375,11 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
                                   &data);
             }
+            const std::uint32_t profile_query = gpu_profile::begin(vk, command_buffer);  // LOCAL DIAGNOSTIC
             for (std::uint32_t k = 0; k < records; ++k) {
                 vk.dispatch_indirect(command_buffer, indirect_buffer, arguments + VkDeviceSize(k) * stride);
             }
+            gpu_profile::end(vk, command_buffer, profile_query, ind->pipeline, 0);
             if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
@@ -5493,7 +5496,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                         &set0, 0, nullptr);
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            const std::uint32_t profile_query = gpu_profile::begin(vk, command_buffer);  // LOCAL DIAGNOSTIC
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+            gpu_profile::end(vk, command_buffer, profile_query, dispatch->pipeline,
+                             std::uint64_t(dispatch->x) * dispatch->y * dispatch->z);
             if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (raster.state) {
             const Draw* draw = raster.state;
@@ -5549,6 +5555,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             const GraphicsPipeline& graphics = *d.graphics;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+            const std::uint32_t draw_profile_query = gpu_profile::begin_draw(vk, command_buffer);  // LOCAL DIAGNOSTIC
+            std::uint64_t draw_profile_records = 0;  // LOCAL DIAGNOSTIC: an indirect draw's maximum record count
             vk.begin_rendering(command_buffer, &rendering);
 
             ShaderUserData data{};
@@ -5647,6 +5655,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 const VkDeviceSize count_offset = clamped ? p.indirect_clamp.count_offset : d.indirect_count_offset;
                 const std::uint32_t records = clamped ? p.indirect_clamp.records : arg.max_count;
                 const std::uint32_t stride = clamped ? p.indirect_clamp.stride : arg.stride;
+                draw_profile_records = records;
                 if (draw->mesh) {
                     if (arg.count_buffer)
                         vk.draw_mesh_tasks_indirect_count(command_buffer, arguments_buffer, arguments_offset, count_buffer,
@@ -5700,6 +5709,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
             vk.end_rendering(command_buffer);
+            gpu_profile::end_draw(vk, command_buffer, draw_profile_query, draw->pipeline,
+                             draw_profile_records);  // LOCAL DIAGNOSTIC: mesh tasks or vertices; 0 = indirect
         }
     }
     // Predication does not carry over to the next command list.

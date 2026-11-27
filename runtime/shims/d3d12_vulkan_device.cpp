@@ -12299,6 +12299,12 @@ public:
         } else {
             device_.context->add_graphics_pipeline(id(), graphics_);
         }
+        if (leonida::gpu_profile::enabled()) {  // LOCAL DIAGNOSTIC
+            std::string profile_name = "draw";
+            for (std::size_t i = 0; i < std::size(stages); ++i)
+                if (stages[i].entry) profile_name += " " + stages[i].entry->name;
+            leonida::gpu_profile::name(id(), profile_name.c_str());
+        }
         registered_ = true;
         is_graphics_ = true;
         return S_OK;
@@ -12439,7 +12445,8 @@ public:
             pipeline_.code_base = code_base_;
         }
         device_.context->add_pipeline(id(), pipeline_,
-                                      device_.info.device_fault_diagnostics ? entry->name.c_str() : nullptr);
+                                      (device_.info.device_fault_diagnostics || leonida::gpu_profile::enabled())
+                                          ? entry->name.c_str() : nullptr);  // LOCAL DIAGNOSTIC: the profile too
         registered_ = true;
         if (pipeline_.build && !pipeline_.skipped) warmup_enqueue(this, spirv_bytes);
         return S_OK;
