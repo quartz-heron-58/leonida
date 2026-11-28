@@ -16199,7 +16199,11 @@ def ms_lds_wave0_only(insns):
       nothing jumps into it and nothing in it jumps back;
     * no branch goes back over a ds_write_b32 (it runs once), and nothing writes s3;
     * its address is a constant: the base VGPR is set by `v_mov_b32 vB, <constant>` earlier in the same run, and the
-      addresses of all the ds_write_b32 are different.
+      addresses of all the ds_write_b32 are different. The constant must arrive in every lane that stores: from its
+      v_mov_b32 to the store EXEC is not written and there is one path (no branch, no branch target);
+    * nothing lands on the guard branch or anywhere in its run from outside, and the store's block is on no cycle.
+    Registers are taken as written by every destination an instruction has (the carry out of v_add_co_u32, both
+    registers of v_swap_b32). Anything else keeps the side-by-side form.
     A program with no `ds_` instruction at all is not this function's business (the caller does not ask)."""
     pcs = {ins["pc"]: i for i, ins in enumerate(insns)}
 
@@ -16221,13 +16225,28 @@ def ms_lds_wave0_only(insns):
     def has_destination(ins):
         return bool(ins["args"]) and not base_op(ins["op"]).startswith(lane_masks.NO_DESTINATION)
 
-    def writes_sgpr(ins, r):
+    def destinations(ins):
+        """The operands an instruction writes: its first, and the second of those that have two (the carry out of
+        v_add_co_u32 and its kin, the other register of v_swap_b32, the saved mask's partner of a saveexec is
+        EXEC itself and is found by writes_exec)."""
         if not has_destination(ins):
-            return False
-        d = ins["args"][0]
-        if d["k"] == "sgpr":
-            return d["r"] <= r < d["r"] + d.get("n", 1)
-        return d["k"] == "slist" and r in d.get("r", ())
+            return []
+        op, a = base_op(ins["op"]), ins["args"]
+        two = op.startswith("v_") and len(a) > 1 and ("_co_" in op or op.startswith(("v_addc", "v_subb", "v_swap")))
+        return a[:2] if two else a[:1]
+
+    def writes_sgpr(ins, r):
+        for d in destinations(ins):
+            if d["k"] == "sgpr" and d["r"] <= r < d["r"] + d.get("n", 1):
+                return True
+            if d["k"] == "slist" and r in d.get("r", ()):
+                return True
+        return False
+
+    def writes_exec(ins):
+        op = base_op(ins["op"])
+        return ("saveexec" in op or op.startswith("v_cmpx") or
+                any(d["k"] == "special" and d.get("t") == "exec" for d in destinations(ins)))
 
     # Every branch as (its pc, its target's pc). A target may be no instruction's first word (the listing has words
     # that do not decode, and branches into them), so the checks below compare addresses, not positions.
@@ -16263,12 +16282,19 @@ def ms_lds_wave0_only(insns):
             if sgpr(a[1]) and a[1]["r"] in state:
                 state.add(slot)
             return
-        if d["k"] == "vgpr":                        # any other write to a VGPR ends what was parked in it
-            for slot in [x for x in state if isinstance(x, tuple) and d["r"] <= x[1] < d["r"] + d.get("n", 1)]:
-                state.discard(slot)
+        written = []
+        for x in destinations(ins):
+            if x["k"] == "vgpr":                    # any other write to a VGPR ends what was parked in it
+                for slot in [y for y in state if isinstance(y, tuple) and x["r"] <= y[1] < x["r"] + x.get("n", 1)]:
+                    state.discard(slot)
+            elif x["k"] == "sgpr":
+                written += range(x["r"], x["r"] + x.get("n", 1))
+            elif x["k"] == "slist":
+                written += [r for r in x.get("r", ()) if isinstance(r, int)]
+        if d["k"] == "vgpr":
+            for r in written:
+                state.discard(r)
             return
-        written = (range(d["r"], d["r"] + d.get("n", 1)) if d["k"] == "sgpr" else
-                   [r for r in d.get("r", ()) if isinstance(r, int)] if d["k"] == "slist" else [])
         holds = (sgpr(d) and len(a) > 1 and (
             (op == "s_bfe_u32" and len(a) == 3 and sgpr(a[1], 3) and a[2]["k"] == "imm" and a[2]["v"] == 0x40018)
             or (op == "s_mov_b32" and len(a) == 2 and sgpr(a[1]) and a[1]["r"] in state)
@@ -16335,12 +16361,40 @@ def ms_lds_wave0_only(insns):
                 return None
         else:
             return None
+        if any(t == pc[g] for _, t in branches):    # reached with a condition the test before it did not set
+            return None
         t = pcs.get(target_of[pc[g]])
         return (g + 1, t) if t is not None and t > g + 1 else None
 
+    # The store must run once: its block is on no cycle of the listing's flow. A branch whose target is no
+    # instruction's first word is taken to go on at the next instruction after it.
+    def lands(t):
+        return next((i for i, q in enumerate(pc) if q >= t), None)
+
+    flow = []
+    for n, first in enumerate(leaders):
+        last = (leaders[n + 1] if n + 1 < len(leaders) else len(insns)) - 1
+        out = list(succ[n])
+        if base_op(insns[last]["op"]) in BRANCHES and target_of[pc[last]] not in pcs:
+            i = lands(target_of[pc[last]])
+            if i is not None:
+                out.append(block_of[i])
+        flow.append(out)
+
+    def on_a_cycle(n):
+        seen, work = set(), list(flow[n])
+        while work:
+            m = work.pop()
+            if m == n:
+                return True
+            if m not in seen:
+                seen.add(m)
+                work += flow[m]
+        return False
+
     addresses = set()
     for w in writes:
-        if any(t <= pc[w] <= b for b, t in branches):            # a branch goes back over it
+        if any(t <= pc[w] <= b for b, t in branches) or on_a_cycle(block_of[w]):   # it could run twice
             return False
         run = next((r for r in (wave0_run(pcs[b]) for b, _ in branches if b < pc[w]) if r and r[0] <= w < r[1]),
                    None)
@@ -16351,21 +16405,27 @@ def ms_lds_wave0_only(insns):
             if pc[lo] <= b < pc[hi]:
                 if t <= b:                                       # a branch in the run goes back
                     return False
-            elif pc[lo] < t < pc[hi]:                            # a jump into the run from outside it
+            elif pc[lo] <= t < pc[hi]:                           # a jump into the run from outside it
                 return False
         a = insns[w]["args"]
         if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
             return False
-        base = None
+        base = at = None
         for k in range(w - 1, lo - 1, -1):
             ka = insns[k]["args"]
-            if has_destination(insns[k]) and ka[0]["k"] == "vgpr" and \
-                    ka[0]["r"] <= a[0]["r"] < ka[0]["r"] + ka[0].get("n", 1):
+            if any(x["k"] == "vgpr" and x["r"] <= a[0]["r"] < x["r"] + x.get("n", 1) for x in destinations(insns[k])):
                 if base_op(insns[k]["op"]) == "v_mov_b32" and len(ka) == 2 and ka[1]["k"] == "imm" and \
                         not insns[k]["mods"]:
-                    base = ka[1]["v"] & 0xFFFFFFFF
+                    base, at = ka[1]["v"] & 0xFFFFFFFF, k
                 break
         if base is None:
+            return False
+        # The constant has to arrive in every lane that stores: v_mov_b32 writes the lanes EXEC has and so does
+        # the store, so EXEC is not written from the one to the other, and that stretch is one path (no branch in
+        # it and no branch target).
+        if any(writes_exec(insns[k]) or base_op(insns[k]["op"]) in BRANCHES for k in range(at, w)):
+            return False
+        if any(pc[at] < t <= pc[w] for _, t in branches):
             return False
         offset = 0
         for m in insns[w]["mods"]:

@@ -13,7 +13,9 @@ LEONIDA_MESH_SERIAL_WAVES=1 draws them. Here:
 * the exchange takes its place in %x_buf from the invocation's own index, not from the lane it runs;
 * ms_w64x_lds_wave0, where wave 0 stores to LDS and both waves read, qualifies, and each way its listing can stop
   being that shape (another wave stores, a second store to the same address, a store in a loop, an address that
-  is not a constant, another `ds_` form) is refused by ms_lds_wave0_only;
+  is not a constant or is set under another EXEC, a jump to the guard or into its run, a write of s3 or of the
+  parked wave number through an instruction's second destination, another `ds_` form) is refused by
+  ms_lds_wave0_only;
 * ms_wave_info_s3, whose waves count lanes in LDS, keeps the side-by-side form, and so does every program
   without --wave64-emulate, under --mesh-compute or of at most 64 threads;
 * without the flag the module is unchanged.
@@ -183,6 +185,22 @@ LDS_REFUSED = {
     "ds_add": lambda a: a.replace("ds_read_b32 v18, v10\n", "ds_read_b32 v18, v10\nds_add_u32 v10, v16\n", 1),
     # The system register that holds the wave's number is written.
     "s3 written": lambda a: a.replace("s_mov_b64 exec, 1\ns_and_b32", "s_mov_b32 s3, 0\ns_mov_b64 exec, 1\ns_and_b32", 1),
+    # The cases of zmasi's check of 1697b4d4f (#1608, VERIFY-MESH-SERIAL-LDS-VEGA20).
+    # EXEC is written between the constant and the store: the lanes that store need not be the lanes that got it.
+    "EXEC written after the constant": lambda a: a.replace(
+        "s_mov_b64 exec, 1\nv_mov_b32_e32 v10, 0\nv_mov_b32_e32 v16, 1", "v_mov_b32_e32 v10, 0\ns_mov_b64 exec, 1\nv_mov_b32_e32 v16, 1", 1),
+    # A branch between the constant and the store.
+    "a branch after the constant": lambda a: a.replace(
+        "v_mov_b32_e32 v10, 0\nv_mov_b32_e32 v16, 1\n", "v_mov_b32_e32 v10, 0\ns_cbranch_execz 0\n", 1),
+    # Something jumps to the guard branch (with a condition its test did not set), or to the line after it.
+    "a jump to the guard": lambda a: a.replace("s_mov_b64 exec, 1\ns_and_b32", "s_branch 2\ns_mov_b64 exec, 1\ns_and_b32", 1),
+    "a jump to the run": lambda a: a.replace("s_mov_b64 exec, 1\ns_and_b32", "s_branch 3\ns_mov_b64 exec, 1\ns_and_b32", 1),
+    # s3 is the second destination of an add with carry out.
+    "s3 written as a carry": lambda a: a.replace("v_mov_b32_e32 v6, 0\n", "v_add_co_u32_e64 v6, s[2:3], v6, v6\n", 1),
+    # The wave's number is parked in a lane and the register is then swapped with another.
+    "parked lane swapped away": lambda a: a.replace(
+        "s_barrier\ns_cmp_eq_i32 s4, 0\n",
+        "s_barrier\nv_writelane_b32 v40, s4, 3\nv_swap_b32 v41, v40\nv_readlane_b32 s7, v40, 3\ns_cmp_eq_i32 s7, 0\n", 1),
 }
 
 
