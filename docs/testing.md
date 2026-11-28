@@ -579,7 +579,7 @@ constants, so those tests skip.
 `LEONIDA_MESH_SERIAL_WAVES=1` for `run_gpu_tests.py`, together with `LEONIDA_W64_EMULATE=1`, translates the mesh
 shaders with `--mesh-serial-waves` (`docs/design.md`, "Mesh shaders with their waves in series"): the ones that
 qualify run one pass per wave in 64 invocations. The `ms_*` tests must pass with and without it;
-`ms_w64x_wave_votes` is the one whose two waves take different branches and both give the triangle a vertex. `ms_w64x_wave_loops` is the one whose two waves run a loop of different length (5 and 9 iterations), each iteration reading a wave-wide count, so under emulation the waves reach different numbers of barriers.
+`ms_w64x_wave_votes` is the one whose two waves take different branches and both give the triangle a vertex. `ms_w64x_wave_loops` is the one whose two waves run a loop of different length (5 and 9 iterations), each iteration reading a wave-wide count, so under emulation the waves reach different numbers of barriers. `ms_w64x_lds_wave0` is the one with LDS that only wave 0 stores to (a launch value, then the counts) and both waves read behind barriers, as the pipeline library's mesh programs do; it runs in series too, and `ms_wave_info_s3`, whose waves all add to LDS, does not.
 
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 

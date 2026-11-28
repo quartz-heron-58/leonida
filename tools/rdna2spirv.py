@@ -16181,6 +16181,204 @@ def insert_late_constants(gen, out, written):
                   [f"{gen.fconsts[v]} = OpConstant %float {float_literal(v)}" for v in late_f])
 
 
+def ms_lds_wave0_only(insns):
+    """--mesh-serial-waves: is the program's LDS traffic one way, from wave 0 to the others?
+
+    The pipeline library's mesh programs pass two things between their waves through LDS: wave 0 stores a launch
+    value in the opening lines, and near the end the vertex and primitive counts it requests; every wave reads them
+    back behind an s_barrier. Run one after the other, wave 0 first, the later waves read what wave 0 stored, so the
+    serial form is exact for such a program. It is not for one whose waves all store, or add (ms_wave_info_s3 counts
+    its lanes with ds_add_u32), or where an address is stored twice (a later wave would read the last value where
+    the hardware gives it the one of its own phase). True only when all of this holds, each checked on the listing:
+
+    * every `ds_` instruction is ds_read_b32 or ds_write_b32;
+    * every ds_write_b32 is in the fall-through run of a branch that only wave 0 falls through: `s_and_b32 sA, s3,
+      0x0f000000` then `s_cbranch_scc1`, or `s_cmp_eq_[iu]32 sW, 0` then `s_cbranch_scc0` where sW holds the number
+      of the wave on every path: `s_bfe_u32 sW, s3, 0x40018` (s3[27:24]), moved with s_mov_b32 or parked in a VGPR
+      lane and fetched back (v_writelane_b32 / v_readlane_b32). The run is straight-line up to the branch's target:
+      nothing jumps into it and nothing in it jumps back;
+    * no branch goes back over a ds_write_b32 (it runs once), and nothing writes s3;
+    * its address is a constant: the base VGPR is set by `v_mov_b32 vB, <constant>` earlier in the same run, and the
+      addresses of all the ds_write_b32 are different.
+    A program with no `ds_` instruction at all is not this function's business (the caller does not ask)."""
+    pcs = {ins["pc"]: i for i, ins in enumerate(insns)}
+
+    def next_pc(ins):
+        return ins["pc"] + (len(ins["enc"]) // 2 if ins.get("enc") else 4)
+
+    def target(ins):
+        if "target" in ins:
+            return ins["target"]
+        imm = next((x for x in ins["args"] if x["k"] == "imm"), None)
+        if imm is None:
+            return None
+        v = imm["v"] & 0xFFFF
+        return next_pc(ins) + 4 * (v - 0x10000 if v & 0x8000 else v)
+
+    def sgpr(x, r=None):
+        return x["k"] == "sgpr" and x.get("n", 1) == 1 and (r is None or x["r"] == r)
+
+    def has_destination(ins):
+        return bool(ins["args"]) and not base_op(ins["op"]).startswith(lane_masks.NO_DESTINATION)
+
+    def writes_sgpr(ins, r):
+        if not has_destination(ins):
+            return False
+        d = ins["args"][0]
+        if d["k"] == "sgpr":
+            return d["r"] <= r < d["r"] + d.get("n", 1)
+        return d["k"] == "slist" and r in d.get("r", ())
+
+    # Every branch as (its pc, its target's pc). A target may be no instruction's first word (the listing has words
+    # that do not decode, and branches into them), so the checks below compare addresses, not positions.
+    branches = []
+    for ins in insns:
+        if base_op(ins["op"]) in BRANCHES:
+            t = target(ins)
+            if t is None:
+                return False
+            branches.append((ins["pc"], t))
+    target_of = dict(branches)
+    pc = [ins["pc"] for ins in insns]
+    writes = []
+    for i, ins in enumerate(insns):
+        op = base_op(ins["op"])
+        if op.startswith("ds_") and op not in ("ds_read_b32", "ds_write_b32"):
+            return False
+        if op == "ds_write_b32":
+            writes.append(i)
+        if writes_sgpr(ins, 3):
+            return False
+
+    def wave_number_step(state, ins):
+        """`state`: the SGPRs, and the (VGPR, lane) slots a v_writelane_b32 parked one in, that hold the wave's
+        number (s3[27:24]) on every path. The compiler keeps it in one register, moves it and parks it."""
+        op, a = base_op(ins["op"]), ins["args"]
+        if not has_destination(ins):
+            return
+        d = a[0]
+        if op == "v_writelane_b32" and len(a) == 3 and d["k"] == "vgpr" and a[2]["k"] == "imm":
+            slot = ("lane", d["r"], a[2]["v"] & 63)
+            state.discard(slot)
+            if sgpr(a[1]) and a[1]["r"] in state:
+                state.add(slot)
+            return
+        if d["k"] == "vgpr":                        # any other write to a VGPR ends what was parked in it
+            for slot in [x for x in state if isinstance(x, tuple) and d["r"] <= x[1] < d["r"] + d.get("n", 1)]:
+                state.discard(slot)
+            return
+        written = (range(d["r"], d["r"] + d.get("n", 1)) if d["k"] == "sgpr" else
+                   [r for r in d.get("r", ()) if isinstance(r, int)] if d["k"] == "slist" else [])
+        holds = (sgpr(d) and len(a) > 1 and (
+            (op == "s_bfe_u32" and len(a) == 3 and sgpr(a[1], 3) and a[2]["k"] == "imm" and a[2]["v"] == 0x40018)
+            or (op == "s_mov_b32" and len(a) == 2 and sgpr(a[1]) and a[1]["r"] in state)
+            or (op == "v_readlane_b32" and len(a) == 3 and a[1]["k"] == "vgpr" and a[2]["k"] == "imm"
+                and ("lane", a[1]["r"], a[2]["v"] & 63) in state)))
+        for r in written:
+            state.discard(r)
+        if holds:
+            state.add(d["r"])
+
+    # Basic blocks of the listing, for wave_number_at(): a forward must-analysis (the meet is the intersection).
+    leaders = sorted({0} | {pcs[t] for _, t in branches if t in pcs} |
+                     {pcs[b] + 1 for b, _ in branches if pcs[b] + 1 < len(insns)})
+    block_of = {}
+    for n, first in enumerate(leaders):
+        for i in range(first, leaders[n + 1] if n + 1 < len(leaders) else len(insns)):
+            block_of[i] = n
+    succ = []
+    for n, first in enumerate(leaders):
+        last = (leaders[n + 1] if n + 1 < len(leaders) else len(insns)) - 1
+        op = base_op(insns[last]["op"])
+        out = []
+        if op in BRANCHES and target_of[pc[last]] in pcs:
+            out.append(block_of[pcs[target_of[pc[last]]]])
+        if op not in ("s_branch", "s_endpgm") and last + 1 < len(insns):
+            out.append(block_of[last + 1])
+        succ.append(out)
+    entry = [None] * len(leaders)
+    entry[0] = frozenset()
+    work = [0]
+    while work:
+        n = work.pop()
+        state = set(entry[n])
+        for i in range(leaders[n], leaders[n + 1] if n + 1 < len(leaders) else len(insns)):
+            wave_number_step(state, insns[i])
+        for m in succ[n]:
+            merged = frozenset(state) if entry[m] is None else entry[m] & state
+            if merged != entry[m]:
+                entry[m] = merged
+                work.append(m)
+
+    def wave_number_at(i):
+        """The registers that hold the wave's number just before instruction i."""
+        n = block_of[i]
+        if entry[n] is None:
+            return set()
+        state = set(entry[n])
+        for k in range(leaders[n], i):
+            wave_number_step(state, insns[k])
+        return state
+
+    def wave0_run(g):
+        """The fall-through run [first index, target index) of the branch at g if only wave 0 falls through."""
+        if g < 1:
+            return None
+        prev = insns[g - 1]
+        op, a = base_op(insns[g]["op"]), prev["args"]
+        if (op == "s_cbranch_scc1" and base_op(prev["op"]) == "s_and_b32" and len(a) == 3 and sgpr(a[0])
+                and sgpr(a[1], 3) and a[2]["k"] == "imm" and a[2]["v"] & 0xFFFFFFFF == 0x0F000000):
+            pass
+        elif (op == "s_cbranch_scc0" and base_op(prev["op"]) in ("s_cmp_eq_i32", "s_cmp_eq_u32") and len(a) == 2
+              and sgpr(a[0]) and a[1]["k"] == "imm" and a[1]["v"] == 0):
+            if a[0]["r"] not in wave_number_at(g - 1):
+                return None
+        else:
+            return None
+        t = pcs.get(target_of[pc[g]])
+        return (g + 1, t) if t is not None and t > g + 1 else None
+
+    addresses = set()
+    for w in writes:
+        if any(t <= pc[w] <= b for b, t in branches):            # a branch goes back over it
+            return False
+        run = next((r for r in (wave0_run(pcs[b]) for b, _ in branches if b < pc[w]) if r and r[0] <= w < r[1]),
+                   None)
+        if run is None:
+            return False
+        lo, hi = run
+        for b, t in branches:
+            if pc[lo] <= b < pc[hi]:
+                if t <= b:                                       # a branch in the run goes back
+                    return False
+            elif pc[lo] < t < pc[hi]:                            # a jump into the run from outside it
+                return False
+        a = insns[w]["args"]
+        if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+            return False
+        base = None
+        for k in range(w - 1, lo - 1, -1):
+            ka = insns[k]["args"]
+            if has_destination(insns[k]) and ka[0]["k"] == "vgpr" and \
+                    ka[0]["r"] <= a[0]["r"] < ka[0]["r"] + ka[0].get("n", 1):
+                if base_op(insns[k]["op"]) == "v_mov_b32" and len(ka) == 2 and ka[1]["k"] == "imm" and \
+                        not insns[k]["mods"]:
+                    base = ka[1]["v"] & 0xFFFFFFFF
+                break
+        if base is None:
+            return False
+        offset = 0
+        for m in insns[w]["mods"]:
+            if not m.startswith("offset:"):
+                return False
+            offset = int(m[len("offset:"):], 0)
+        address = (base + offset) & 0xFFFFFFFF
+        if address in addresses:
+            return False
+        addresses.add(address)
+    return True
+
+
 def ms_serial_passes(gen, fn, lists):
     """--mesh-serial-waves: the function's variables, then a loop over the passes around the prologue (and, appended
     by the caller, the body). Returns the new `fn`, the lines that close the loop after the body, and the export
@@ -18940,11 +19138,15 @@ def _translate(path):
         g.x_lanes = -(-size[0] * size[1] * size[2] // 64) * 64
         threads = size[0] * size[1] * size[2]
         if (MESH_SERIAL_WAVES and stage == "ms" and not MESH_COMPUTE and threads > 64 and threads % 64 == 0
-                and not any(i["op"].startswith("ds_") or "store" in i["op"] or "atomic" in i["op"] for i in insns)):
-            # The waves of such a program cannot pass each other anything: no LDS, and no store or atomic to
-            # memory another wave could read (ms_wave_info_s3 counts lanes in LDS across an s_barrier and keeps
-            # the side-by-side form). What is left between them is the allocation request and the exports, which
-            # assemble() orders itself. The order of the waves is then not observable.
+                and not any(not i["op"].startswith("ds_") and ("store" in i["op"] or "atomic" in i["op"])
+                            for i in insns)
+                and (not any(i["op"].startswith("ds_") for i in insns) or ms_lds_wave0_only(insns))):
+            # The waves of such a program cannot pass each other anything that depends on their order: no store or
+            # atomic to memory another wave could read, and no LDS, or LDS that only wave 0 stores to and the
+            # others read (ms_lds_wave0_only: the pipeline library's mesh programs; ms_wave_info_s3 counts lanes in
+            # LDS with ds_add_u32 across an s_barrier and keeps the side-by-side form). %lds is Workgroup memory, so
+            # what pass 0 stored is there for the later passes. What is left between the waves is the allocation
+            # request and the exports, which assemble() orders itself.
             g.ms_serial = threads // 64      # passes; every pass is one whole wave
             g.x_lanes = 64
             for k in range(g.ms_serial + 1):

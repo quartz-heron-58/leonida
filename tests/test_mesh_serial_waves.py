@@ -2,8 +2,8 @@
 
 Under --wave64-emulate a 128-thread mesh shader is two waves side by side in one workgroup, and what the waves do
 not do alike goes through mini-schedulers. With --mesh-serial-waves a program whose waves cannot pass each other
-anything (no LDS, no store or atomic to memory) declares 64 invocations and runs one pass per wave, each pass a
-single wave. The inputs are the hand-written GPU tests runtime/test/shaders/ms_*.asm with conftest's synthetic
+anything that depends on their order (no store or atomic to memory; no LDS, or LDS that only wave 0 stores to and
+the others read) declares 64 invocations and runs one pass per wave, each pass a single wave. The inputs are the hand-written GPU tests runtime/test/shaders/ms_*.asm with conftest's synthetic
 PSV0 containers (no game data); on the GPU, scripts/run_gpu_tests.py with LEONIDA_W64_EMULATE=1 and
 LEONIDA_MESH_SERIAL_WAVES=1 draws them. Here:
 * a program that qualifies declares LocalSize 64, loops over the passes (and, when it has branches, has no
@@ -11,6 +11,9 @@ LEONIDA_MESH_SERIAL_WAVES=1 draws them. Here:
   the mesh outputs once; it passes spirv-val; the metadata records the number of passes and keeps the program's
   thread count;
 * the exchange takes its place in %x_buf from the invocation's own index, not from the lane it runs;
+* ms_w64x_lds_wave0, where wave 0 stores to LDS and both waves read, qualifies, and each way its listing can stop
+  being that shape (another wave stores, a second store to the same address, a store in a loop, an address that
+  is not a constant, another `ds_` form) is refused by ms_lds_wave0_only;
 * ms_wave_info_s3, whose waves count lanes in LDS, keeps the side-by-side form, and so does every program
   without --wave64-emulate, under --mesh-compute or of at most 64 threads;
 * without the flag the module is unchanged.
@@ -26,8 +29,9 @@ from conftest import ROOT, SAMPLE_DXBC, requires_tools
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import rdna2spirv  # noqa: E402
 
-SERIAL = ("ms_tri", "ms_clip", "ms_f16_pack", "ms_w64x_ballot", "ms_w64x_wave_votes", "ms_w64x_wave_loops")
-SIDE_BY_SIDE = ("ms_wave_info_s3",      # LDS shared by the waves
+SERIAL = ("ms_tri", "ms_clip", "ms_f16_pack", "ms_w64x_ballot", "ms_w64x_wave_votes", "ms_w64x_wave_loops",
+          "ms_w64x_lds_wave0")          # LDS that only wave 0 stores to (ms_lds_wave0_only)
+SIDE_BY_SIDE = ("ms_wave_info_s3",      # LDS every wave adds to
                 "ms_v5_workgroup")      # 32 threads: one partial wave
 
 
@@ -136,3 +140,69 @@ def test_a_wave_that_ends_early_does_not_skip_the_later_passes(make_shader):
     # One return, after the loop over the passes and after the outputs are written.
     assert main.count("OpReturn") == 1 and "OpKill" not in main and "OpTerminateInvocation" not in main
     assert main.index("%msw_exit = OpLabel") < main.index("OpSetMeshOutputsEXT") < main.index("OpReturn")
+
+
+def _lds_listing(make_shader, name="ms_w64x_lds_wave0", edit=None):
+    """The instructions of ms_w64x_lds_wave0, after `edit` (a function from its source text to another) if given."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_w64x_lds_wave0.asm"), encoding="utf-8") as f:
+        asm = f.read()
+    if edit:
+        changed = edit(asm)
+        assert changed != asm
+        asm = changed
+    shader = make_shader(asm, name, dxbc=SAMPLE_DXBC["ms_w64x_lds_wave0"])
+    return rdna2spirv.parse_file(str(shader.path))["insns"]
+
+
+@requires_tools
+def test_lds_that_only_wave0_stores_to_qualifies(make_shader):
+    assert rdna2spirv.ms_lds_wave0_only(_lds_listing(make_shader))
+
+
+@requires_tools
+def test_ms_wave_info_s3_lds_does_not_qualify(make_shader):
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_wave_info_s3.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_wave_info_s3", dxbc=SAMPLE_DXBC["ms_wave_info_s3"])
+    assert not rdna2spirv.ms_lds_wave0_only(rdna2spirv.parse_file(str(shader.path))["insns"])
+
+
+LDS_REFUSED = {
+    # The store of the opening lines no longer behind the wave test: every wave stores.
+    "every wave stores": lambda a: a.replace("s_cbranch_scc1 6\n", "s_nop 0\n", 1),
+    # The second pair's test is on a register that is not the wave's number.
+    "test of another register": lambda a: a.replace("s_cmp_eq_i32 s4, 0\n", "s_cmp_eq_i32 s5, 0\n", 1),
+    # The register tested is written again between its s_bfe_u32 and the test.
+    "wave number overwritten": lambda a: a.replace("s_barrier\ns_cmp_eq_i32 s4, 0\n",
+                                                  "s_barrier\ns_add_u32 s4, s4, 0\ns_cmp_eq_i32 s4, 0\n", 1),
+    # Two stores to one address: a later wave would read the second where the hardware gives it the first.
+    "an address stored twice": lambda a: a.replace("ds_write_b32 v10, v17 offset:4", "ds_write_b32 v10, v17", 1),
+    # The base register of a store is not a constant set in the same run.
+    "address not a constant": lambda a: a.replace("s_mov_b64 exec, 1\nv_mov_b32_e32 v10, 0\nv_mov_b32_e32 v16, 1",
+                                                 "s_mov_b64 exec, 1\nv_mov_b32_e32 v10, v0\nv_mov_b32_e32 v16, 1", 1),
+    # Another `ds_` form: an add is every wave's business.
+    "ds_add": lambda a: a.replace("ds_read_b32 v18, v10\n", "ds_read_b32 v18, v10\nds_add_u32 v10, v16\n", 1),
+    # The system register that holds the wave's number is written.
+    "s3 written": lambda a: a.replace("s_mov_b64 exec, 1\ns_and_b32", "s_mov_b32 s3, 0\ns_mov_b64 exec, 1\ns_and_b32", 1),
+}
+
+
+@requires_tools
+@pytest.mark.parametrize("why", sorted(LDS_REFUSED))
+def test_lds_shapes_that_are_refused(make_shader, why):
+    assert not rdna2spirv.ms_lds_wave0_only(_lds_listing(make_shader, edit=LDS_REFUSED[why])), why
+
+
+@requires_tools
+def test_the_wave_number_is_followed_through_a_move_and_a_parked_lane(make_shader):
+    # The compiler moves the wave's number and parks it in a VGPR lane; the test of the fetched copy still counts.
+    def moved(a):
+        return a.replace("s_barrier\ns_cmp_eq_i32 s4, 0\n",
+                         "s_barrier\ns_mov_b32 s6, s4\nv_writelane_b32 v40, s6, 3\ns_mov_b32 s6, 0\n"
+                         "v_readlane_b32 s7, v40, 3\ns_cmp_eq_i32 s7, 0\n", 1)
+    assert rdna2spirv.ms_lds_wave0_only(_lds_listing(make_shader, edit=moved))
+
+    def lost(a):       # the lane is written with something else before it is fetched
+        return a.replace("s_barrier\ns_cmp_eq_i32 s4, 0\n",
+                         "s_barrier\nv_writelane_b32 v40, s4, 3\nv_writelane_b32 v40, s9, 3\n"
+                         "v_readlane_b32 s7, v40, 3\ns_cmp_eq_i32 s7, 0\n", 1)
+    assert not rdna2spirv.ms_lds_wave0_only(_lds_listing(make_shader, edit=lost))
